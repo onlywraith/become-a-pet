@@ -1,0 +1,387 @@
+local RunService = game:GetService("RunService") or game.RunService
+local Workspace  = game:GetService("Workspace") or workspace
+local Players    = game:GetService("Players") or game.Players
+local lp         = Players.LocalPlayer
+
+local cfg = {
+    enabled          = true,
+    hide_common      = false,
+    labels           = true,
+    show_distance    = true,
+    label_range      = 0,
+    plain_label_range= 0,
+    scan_interval    = 2,
+    slow_interval    = 0.15,
+    r_min            = 2,
+    r_max            = 5,
+    r_scale          = 400,
+    text_size        = 12,
+    rare_text_size   = 13,
+    plain_color      = Color3.fromRGB(170, 170, 170),
+    special_color    = Color3.fromRGB(255, 215, 0),
+    filters = {
+        common    = true,
+        rare      = true,
+        epic      = true,
+        legendary = true,
+        mythical  = true,
+        eternal   = true,
+        special   = true,
+    },
+    tiers = {
+        { key = "eternal",   match = "eternal",   label = "Eternal",   color = Color3.fromRGB(120, 255, 255), rare = true  },
+        { key = "mythical",  match = "mythic",    label = "Mythical",  color = Color3.fromRGB(255, 80, 200),  rare = true  },
+        { key = "legendary", match = "legendary", label = "Legendary", color = Color3.fromRGB(255, 170, 0),   rare = true  },
+        { key = "epic",      match = "epic",      label = "Epic",      color = Color3.fromRGB(170, 80, 255),  rare = true  },
+        { key = "rare",      match = "rare",      label = "Rare",      color = Color3.fromRGB(60, 140, 255),  rare = true  },
+        { key = "common",    match = "common",    label = "Common",    color = Color3.fromRGB(170, 170, 170), rare = false },
+    },
+}
+
+local RARITY_ATTRS = { "Rarity", "rarity", "Tier" }
+local OTHER_ATTRS  = { "EggType", "EggName", "EggId", "TemplateId", "Template", "Type", "PetName" }
+local NEVER = -1e9
+
+if _G.__EggESP_cleanup then pcall(_G.__EggESP_cleanup) end
+local S = { running = true, map = {}, list = {}, scanCount = 0 }
+
+local floor, max, min, abs = math.floor, math.max, math.min, math.abs
+
+local function safe(f, ...)
+    local ok, a = pcall(f, ...)
+    if ok then return a end
+    return nil
+end
+
+local function setProp(o, k, v) return pcall(function() o[k] = v end) end
+
+local fontProp = nil
+local function setFont(t, n)
+    if fontProp then setProp(t, fontProp, n); return end
+    if setProp(t, "FontSize", n) then fontProp = "FontSize"
+    elseif setProp(t, "Size", n) then fontProp = "Size" end
+end
+
+local function meshOf(model)
+    return safe(function() return model:FindFirstChild("EggMesh") end)
+        or safe(function()
+            for _, c in ipairs(model:GetChildren()) do
+                if c:IsA("BasePart") then return c end
+            end
+        end)
+end
+
+local function findTier(text)
+    for _, t in ipairs(cfg.tiers) do
+        if string.find(text, t.match, 1, true) then return t end
+    end
+    return nil
+end
+
+local function analyze(model)
+    local rv
+    for _, an in ipairs(RARITY_ATTRS) do
+        local v = safe(function() return model:GetAttribute(an) end)
+        if v ~= nil then rv = tostring(v); break end
+    end
+    local tier = rv and findTier(string.lower(rv)) or nil
+
+    if not tier then
+        tier = findTier(string.lower(model.Name))
+    end
+    if not tier then
+        for _, an in ipairs(OTHER_ATTRS) do
+            local v = safe(function() return model:GetAttribute(an) end)
+            if v ~= nil then
+                tier = findTier(string.lower(tostring(v)))
+                if tier then break end
+            end
+        end
+    end
+
+    local special, lightColor = false, nil
+    safe(function()
+        for _, d in ipairs(model:GetDescendants()) do
+            if string.find(tostring(d.ClassName), "Light", 1, true) then
+                if d.Name ~= "EggWhiteLight" then special = true end
+                lightColor = safe(function() return d.Color end) or lightColor
+            end
+        end
+    end)
+
+    if not tier and not special then
+        safe(function()
+            for _, d in ipairs(model:GetDescendants()) do
+                tier = findTier(string.lower(d.Name))
+                if tier then break end
+            end
+        end)
+    end
+
+    if tier then
+        return { kind = tier.key, rare = tier.rare, color = tier.color, label = tier.label }
+    elseif special then
+        return { kind = "special", rare = true, color = lightColor or cfg.special_color, label = rv or "Special" }
+    end
+    return { kind = "common", rare = false, color = cfg.plain_color, label = rv or "Egg" }
+end
+
+local function newDrawings(o)
+    local ob = Drawing.new("Circle")
+    setProp(ob, "NumSides", 12); setProp(ob, "Filled", true); setProp(ob, "Thickness", 1)
+    setProp(ob, "ZIndex", 1)
+    ob.Color = Color3.fromRGB(0, 0, 0)
+    ob.Visible = false
+
+    local c = Drawing.new("Circle")
+    setProp(c, "NumSides", 12); setProp(c, "Filled", true); setProp(c, "Thickness", 1)
+    setProp(c, "ZIndex", 2)
+    c.Visible = false
+
+    local t = Drawing.new("Text")
+    setProp(t, "Center", true); setProp(t, "Outline", true)
+    setFont(t, cfg.text_size)
+    t.Visible = false
+
+    o.outline, o.circle, o.text = ob, c, t
+    o.cVis, o.tVis = false, false
+    o.px, o.py = NEVER, NEVER
+    o.r, o.fs = 4, cfg.text_size
+    o.lastLbl = ""
+    o.active, o.wantLabel = false, false
+end
+
+local function applyInfo(o)
+    local info = o.info
+    o.circle.Color = info.color
+    o.text.Color = info.color
+    o.fs = info.rare and cfg.rare_text_size or cfg.text_size
+    setFont(o.text, o.fs)
+    o.lastLbl = ""
+    o.px = NEVER
+end
+
+local function removeObj(o)
+    pcall(function() o.outline:Remove() end)
+    pcall(function() o.circle:Remove() end)
+    pcall(function() o.text:Remove() end)
+end
+
+local function rescan()
+    local folder = safe(function() return Workspace:FindFirstChild("WorldEggs") end)
+    if not folder then return end
+    local kids = safe(function() return folder:GetChildren() end) or {}
+    S.scanCount = S.scanCount + 1
+    local refresh = (S.scanCount % 5 == 0)   -- re-read rarity every ~10s
+
+    local alive, list = {}, {}
+    for _, model in ipairs(kids) do
+        alive[model] = true
+        local o = S.map[model]
+        if not o then
+            local mesh = meshOf(model)
+            if mesh then
+                o = { model = model, mesh = mesh }
+                newDrawings(o)
+                o.info = analyze(model)
+                applyInfo(o)
+                S.map[model] = o
+            end
+        elseif refresh then
+            o.info = analyze(model)
+            applyInfo(o)
+        end
+        if o then
+            if not o.mesh then o.mesh = meshOf(model) end
+            -- cache world position (only place we read it)
+            local p = o.mesh and safe(function() return o.mesh.Position end)
+            if p then o.pos = p end
+            list[#list + 1] = o
+        end
+    end
+    for model, o in pairs(S.map) do
+        if not alive[model] then removeObj(o); S.map[model] = nil end
+    end
+    S.list = list
+end
+
+task.spawn(function()
+    while S.running do
+        pcall(rescan)
+        wait(cfg.scan_interval)
+    end
+end)
+
+local function slow()
+    local curPos = safe(function()
+        local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+        return hrp and hrp.Position
+    end)
+
+    local list = S.list
+    for i = 1, #list do
+        local o = list[i]
+        local info = o.info
+        local kind = info and info.kind or "common"
+        local act = cfg.enabled and info ~= nil and o.pos ~= nil
+            and (cfg.filters[kind] ~= false)
+            and ((not cfg.hide_common) or info.rare)
+        local dist = 0
+        if act and curPos then dist = (o.pos - curPos).Magnitude end
+        o.active = act and true or false
+
+        if o.active then
+            local r = floor(max(cfg.r_min, min(cfg.r_max, cfg.r_scale / max(dist, 1))))
+            if info.rare then r = r + 1 end
+            if r ~= o.r then
+                o.r = r
+                o.circle.Radius = r
+                o.outline.Radius = r + 1
+                o.px = NEVER            -- force text/dot reposition
+            end
+
+            local range = info.rare and cfg.label_range or cfg.plain_label_range
+            local want = cfg.labels and ((not curPos) or range == 0 or dist <= range)
+            o.wantLabel = want and true or false
+            if want then
+                local lbl = info.label
+                if cfg.show_distance and curPos then
+                    lbl = lbl .. " " .. (floor(dist / 10) * 10)
+                end
+                if lbl ~= o.lastLbl then o.text.Text = lbl; o.lastLbl = lbl end
+            end
+        end
+    end
+end
+
+task.spawn(function()
+    while S.running do
+        pcall(slow)
+        wait(cfg.slow_interval)
+    end
+end)
+
+local function hide(o)
+    if o.cVis then o.circle.Visible = false; o.outline.Visible = false; o.cVis = false end
+    if o.tVis then o.text.Visible = false; o.tVis = false end
+end
+
+local function frame()
+    local list = S.list
+    for i = 1, #list do
+        local o = list[i]
+        if o.active then
+            local screen, on = WorldToScreen(o.pos)
+            if on and screen then
+                local fresh = false
+                if not o.cVis then
+                    o.outline.Visible = true; o.circle.Visible = true
+                    o.cVis = true; fresh = true
+                end
+                if o.wantLabel then
+                    if not o.tVis then o.text.Visible = true; o.tVis = true; fresh = true end
+                elseif o.tVis then
+                    o.text.Visible = false; o.tVis = false
+                end
+
+                local x, y = screen.X, screen.Y
+                if fresh or abs(x - o.px) > 0.4 or abs(y - o.py) > 0.4 then
+                    o.px, o.py = x, y
+                    local p = Vector2.new(x, y)
+                    o.circle.Position = p
+                    o.outline.Position = p
+                    if o.wantLabel then
+                        o.text.Position = Vector2.new(x, y - o.r - o.fs - 3)
+                    end
+                end
+            else
+                hide(o)
+            end
+        else
+            hide(o)
+        end
+    end
+end
+
+S.conn = RunService.Heartbeat:Connect(function()
+    pcall(frame)
+end)
+
+local function stop()
+    S.running = false
+    pcall(function() if S.conn then S.conn:Disconnect() end end)
+    for _, o in pairs(S.map) do removeObj(o) end
+    S.map = {}
+    S.list = {}
+end
+_G.__EggESP_cleanup = stop
+
+pcall(function()
+    pcall(function()
+        loadstring(game:HttpGet("https://raw.githubusercontent.com/Shoobie-code/linoria-inspired/refs/heads/main/main"))()
+    end)
+    local Library = rawget(_G, "UILib")
+    if type(Library) ~= "table" then return end
+
+    local win = Library:CreateWindow({
+        id = "egg_esp_menu",
+        title = "egg esp",
+        size = { 380, 470 },
+        columns = 1,
+        onUnload = function() pcall(stop) end,
+    })
+    local tab = win:AddTab("main")
+
+    local master = tab:AddGroup("esp", 1)
+    master:AddToggle({
+        text = "enabled",
+        flag = "egg_enabled",
+        default = cfg.enabled,
+        tooltip = "turn the whole overlay on or off",
+        callback = function(v) cfg.enabled = v end,
+    })
+
+    local opts = tab:AddGroup("display", 1)
+    opts:AddToggle({
+        text = "labels",
+        flag = "egg_labels",
+        default = cfg.labels,
+        callback = function(v) cfg.labels = v end,
+    })
+    opts:AddToggle({
+        text = "show distance",
+        flag = "egg_show_distance",
+        default = cfg.show_distance,
+        callback = function(v) cfg.show_distance = v end,
+    })
+    opts:AddToggle({
+        text = "hide common",
+        flag = "egg_hide_common",
+        default = cfg.hide_common,
+        tooltip = "only show eggs above Common",
+        callback = function(v) cfg.hide_common = v end,
+    })
+
+    local types = tab:AddGroup("egg types", 1)
+    for _, t in ipairs(cfg.tiers) do
+        types:AddToggle({
+            text = string.lower(t.label),
+            flag = "egg_" .. t.key,
+            default = cfg.filters[t.key],
+            callback = function(v) cfg.filters[t.key] = v end,
+        })
+    end
+    types:AddToggle({
+        text = "special (untiered)",
+        flag = "egg_special",
+        default = cfg.filters.special,
+        tooltip = "eggs with a light but no recognised rarity",
+        callback = function(v) cfg.filters.special = v end,
+    })
+
+    if type(win.AddSettingsTab) == "function" then
+        win:AddSettingsTab("settings")
+    end
+end)
+
+pcall(function() notify("egg esp loaded", "eggesp", 3) end)
